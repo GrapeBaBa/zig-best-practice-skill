@@ -1,0 +1,10 @@
+{
+  "plugins": [
+    {
+      "name": "zig-best-practice",
+      "source": ".",
+      "description": "Comprehensive Zig best practices for memory safety, error handling, comptime patterns, memory layout, thread safety, smart pointers, and C interop.",
+      "version": "1.0.0"
+    }
+  ]
+}

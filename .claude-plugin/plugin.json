@@ -1,0 +1,8 @@
+{
+  "name": "zig-best-practice",
+  "description": "Comprehensive Zig best practices for memory safety, error handling, comptime patterns, memory layout, thread safety, smart pointers, and C interop. Derived from production codebases: TigerBeetle, Bun, libxev, and Ghostty.",
+  "version": "1.0.0",
+  "author": {
+    "name": "grapebaba"
+  }
+}
