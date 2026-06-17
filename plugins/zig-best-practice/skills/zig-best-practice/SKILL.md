@@ -1677,3 +1677,36 @@ concurrency. *[Zig stdlib]*
 
 (On a multi-task runtime like zio, both normally enqueue a task and return immediately; `async`'s inline
 fallback only kicks in when a task can't be spawned — resource exhaustion or shutdown.) *[zio]*
+
+### Cancelable vs cancellation-shielded blocking — `lock` vs `lockUncancelable`
+
+Blocking sync ops come in two forms. Note the pair is `lock` / **`lockUncancelable`** — the base `lock`
+is *already* the cancelable one, the suffix marks the shielded exception (there is no `lockCancelable`):
+
+- **`mutex.lock(rt) Cancelable!void` — a cancellation point.** If the task is canceled while waiting for
+  the lock, it cleanly leaves the wait queue and returns `error.Canceled`. This is the default: a task
+  blocked on a lock should stay cancelable. Propagate it: `try mutex.lock(rt)`.
+- **`mutex.lockUncancelable(rt) void` — cancellation-shielded, infallible.** It ignores cancellation
+  *during acquisition* and is guaranteed to return holding the lock. Use it in **critical / cleanup
+  sections that must complete regardless of cancellation** — exactly the paths that run *because* you're
+  being torn down (`defer …close(rt)`, releasing/posting). If you still need to react to a pending cancel
+  afterward, call `runtime.checkCanceled()`.
+
+Rule: **acquire-to-do-work → `lock` (cancelable); acquire-to-clean-up → `lockUncancelable`.** On a
+teardown path, `lock`'s `error.Canceled` has nowhere to go, and you must not bail out mid-cleanup.
+
+```zig
+// normal work — a task blocked here can still be canceled
+try mutex.lock(rt);
+defer mutex.unlock(rt);
+doWork();
+
+// cleanup path — must complete even though we're being canceled; don't reintroduce a cancel point
+fn close(self: *Conn, rt: *Runtime) void {
+    self.mutex.lockUncancelable(rt);  // shielded: cannot return error.Canceled
+    defer self.mutex.unlock(rt);
+    self.releaseResources();
+}
+```
+*[zio]* (std.Io mirrors this: `Mutex.lock` is `Cancelable!void`; `Mutex.lockUncancelable` is infallible.
+Same split shows up elsewhere as the `*Uncancelable` suffix, e.g. `Queue.getOneUncancelable`.)
