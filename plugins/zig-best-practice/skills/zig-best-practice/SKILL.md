@@ -1095,6 +1095,28 @@ const MyType = @import("my_module.zig").MyType;
 ```
 *[TigerBeetle]*
 
+### Import Naming — no `_mod` / `_module` suffix
+
+Don't alias a module just to reach its decls, and never reach for a `_mod`/`_module` suffix to dodge a
+name collision — it's a smell that you only wanted a decl out of the module:
+
+```zig
+// BAD: the alias exists only to pull two types out; `_mod` dodges a `key` name collision
+const key_mod = @import("key.zig");
+const CheckpointKey = key_mod.CheckpointKey;
+const CheckpointKeyContext = key_mod.CheckpointKeyContext;
+
+// GOOD: import the decls directly — no alias, no collision, no suffix
+const CheckpointKey = @import("key.zig").CheckpointKey;
+const CheckpointKeyContext = @import("key.zig").CheckpointKeyContext;
+```
+
+- **Want a type/decl?** Import it directly: `const Foo = @import("foo.zig").Foo;`.
+- **Genuinely need the whole module** (several decls, used widely)? Bind it under the module's own name
+  (`const foo = @import("foo.zig");` → `foo.Bar`, `foo.baz()`). If that name collides with a local,
+  rename the *local* or import the specific decls — don't paper over it with `_mod`.
+*[Zig stdlib]*
+
 ### Scoped Logging
 
 Every module that logs should create a scoped logger:
