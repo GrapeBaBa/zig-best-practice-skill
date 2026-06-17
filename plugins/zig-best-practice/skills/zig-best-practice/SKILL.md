@@ -1636,3 +1636,44 @@ var task = try rt.spawn(connectionHandler, .{ rt, stream }, .{});
 task.detach(rt);   // runs in background; `task` is now off-limits
 ```
 *[zio]*
+
+### `std.Io`: `async` vs `concurrent` — choose by whether correctness *requires* concurrency
+
+Below the task API sits the `std.Io` primitive pair. Both call `function` and return a `Future` you
+`await` later (`future.await(io)` / `future.cancel(io)`) — the difference is the **guarantee**, and it's
+a correctness decision, not a style one:
+
+- **`io.async(f, args) → Future(R)` — cannot fail.** *Weaker* guarantee: the function *may* run inline
+  (synchronously, before `async` returns) **or** be assigned a unit of concurrency. This is **portable** —
+  it works even on a single-threaded blocking `Io`. Use it when the result is correct either way and
+  concurrency is only an optimization. If the runtime can't spawn (resource exhaustion / shutdown), it
+  just runs the function inline — no error.
+- **`io.concurrent(f, args) → ConcurrentError!Future(R)` — can fail with `error.ConcurrencyUnavailable`.**
+  *Stronger* guarantee: the function makes progress **concurrently while the caller does other work /
+  awaits**. This **restricts** which `Io` implementations work (a single-threaded blocking `Io` cannot
+  provide it → the error). Use it **only when correctness requires** concurrency.
+
+The deadlock test decides it: if the caller `await`s something the spawned function must *produce while
+the caller is waiting*, you need `concurrent` — `async` could legally run it inline and deadlock.
+
+```zig
+// async — "run this too, I'll await it later"; may run inline; infallible
+var fut = io.async(fetch, .{ io, url });
+const local = computeLocally();
+const data = fut.await(io);
+
+// concurrent — "this MUST run while I await it"; you must handle the failure
+var producer = io.concurrent(produce, .{ io, queue }) catch |err| switch (err) {
+    error.ConcurrencyUnavailable => return err, // a single-threaded blocking Io can't run this pattern
+};
+const item = queue.getOne(io);  // would DEADLOCK if `produce` were allowed to run inline
+_ = producer.await(io);
+```
+
+**Rule of thumb:** default to `async` (portable, infallible); reach for `concurrent` *only* when you'd
+deadlock without real concurrency — and then you must handle `error.ConcurrencyUnavailable`.
+`error.ConcurrencyUnavailable` itself means resource exhaustion **or** the `Io` impl doesn't support
+concurrency. *[Zig stdlib]*
+
+(On a multi-task runtime like zio, both normally enqueue a task and return immediately; `async`'s inline
+fallback only kicks in when a task can't be spawned — resource exhaustion or shutdown.) *[zio]*
