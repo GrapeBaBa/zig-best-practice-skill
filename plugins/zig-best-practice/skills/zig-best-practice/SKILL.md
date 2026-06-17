@@ -1,6 +1,6 @@
 ---
 name: zig-best-practice
-description: General Zig best practices for memory safety, error handling, comptime patterns, and memory layout. Use when writing, modifying, or reviewing any .zig code in any project.
+description: General Zig best practices for memory safety, error handling, comptime patterns, memory layout, and concurrency (atomics/lock-free and structured async / coroutine tasks). Use when writing, modifying, or reviewing any .zig code in any project, including async I/O and task-based concurrency.
 ---
 
 # Zig Best Practices
@@ -1014,6 +1014,31 @@ accounts_count    // qualifier last
 
 *[TigerBeetle]*
 
+### Ownership in Method Names
+
+Encode ownership transfer in the **verb**, matching the std library — don't invent `Owned`/`take` affixes:
+
+- **Insert (the container takes the value):** `put` / `add` / `append`. Handing a value in already
+  *implies* the container now holds it — never `putOwned`.
+- **`Owned` means the CALLER owns the RESULT.** `std.ArrayList.toOwnedSlice()` hands the slice to the
+  caller. So naming an *insert* `addOwned` **inverts** the convention (it reads as "returns something I
+  own"). Reserve `*Owned` for "the returned value is now yours."
+- **Read / borrow:** `get` (returns the value) / `getPtr` (returns a pointer *into* the container — a borrow).
+- **Remove + return ownership:** `pop` (last), `swapRemove` / `orderedRemove` (by index); for maps the
+  **`fetch*`** prefix = "do the op AND return the displaced/removed item" so the caller can free it:
+  `fetchRemove`, `fetchPut`.
+
+```zig
+map.put(key, value);                          // container takes value (transfer implied — not putOwned)
+const v = map.get(key);                       // borrow / copy out
+const kv = map.fetchRemove(key);              // remove AND hand the entry back (you free it)
+const last = list.pop();                      // remove + return (you own it now)
+const owned = list.toOwnedSlice(allocator);   // caller now owns the returned slice
+```
+
+Anti-examples: `addOwned(x)` → `add(x)` / `put(x)`; `takeHeadState()` → `popHead()` / `fetchRemoveHead()`.
+`take`/`Owned`-on-insert are non-idiomatic, and `Owned`-on-insert inverts std's meaning. *[Zig stdlib]*
+
 ### Named Arguments via Struct
 
 Use `options: struct` when arguments can be mixed up (e.g., two `u64` params):
@@ -1534,3 +1559,154 @@ pub const Allocator = extern struct {
 
 Enables passing allocators across the C/Zig boundary in either direction.
 *[Ghostty]*
+
+## 11. Async Concurrency (Runtime / Coroutine Tasks)
+
+Patterns for **structured concurrency** on a coroutine runtime — stackful coroutines (fibers) that
+*suspend* on I/O so you write concurrent code in straight-line, sequential style. Thousands run on one
+OS thread (concurrent, not parallel unless the runtime is multi-threaded). This is a different layer
+from §8 (low-level atomics / lock-free) — here the unit is a *task*, not an atomic word.
+
+### Structured spawn → join, with `defer cancel`
+
+Every spawned task must be **`join`ed** (waits, then releases the task's resources) or **`detach`ed**.
+Pair a `spawn` with `defer task.cancel(rt)` so any early return tears the task down — `cancel` after a
+successful `join` is a safe no-op, which makes this the clean structured-cleanup idiom:
+
+```zig
+var task = try rt.spawn(myTask, .{ rt, stream }, .{});
+defer task.cancel(rt);             // torn down on any early return; safe even after join
+
+const result = try task.join(rt);  // wait, release resources, propagate the task's error
+```
+*[zio]*
+
+### Cancellation: handle AND *always* propagate `error.Canceled`
+
+A canceled task's in-flight operation returns `error.Canceled` at its next suspension point. **Never
+swallow it** — let it propagate so the cancellation actually unwinds the task. Pair with
+`defer resource.close(rt)` so cleanup runs on the cancel path too (the suspension point throws, which
+unwinds the `defer`s):
+
+```zig
+fn handler(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);                    // runs on normal exit AND on cancellation
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = try stream.read(rt, &buf);   // returns error.Canceled when canceled → `try` propagates it
+        try process(buf[0..n]);
+    }
+}
+```
+*[zio]*
+
+### Tasks have a FIXED stack — keep big buffers off it
+
+Unlike Go goroutines or Java virtual threads (which grow their stacks), a stackful-coroutine task has a
+**fixed** stack (e.g. 256 KiB by default); overflowing it **crashes the process**, not a catchable
+error. Heap large buffers, bound recursion (see "no recursion" in TigerStyle), and raise `.stack_size`
+only for genuinely deep tasks:
+
+```zig
+var task = try rt.spawn(deepWork, .{}, .{ .stack_size = 1024 * 1024 });
+```
+*[zio]*
+
+### Get concurrency by spawning, not by nesting callbacks
+
+The point of coroutine tasks is to write I/O as sequential code (`try stream.read(rt, buf)`), not
+callback chains. Add concurrency by spawning *more tasks* (e.g. one per connection), not by deepening
+callback nesting — the runtime multiplexes them on the thread(s) and the code stays readable. *[zio]*
+
+### Use task-aware sync primitives — never block the OS thread inside a task
+
+Inside a task, synchronize with the runtime's primitives (`Channel`, `Mutex`, `Semaphore`, `ResetEvent`,
+`Condition`, `Notify`) — they **suspend the task** and yield the thread to other tasks. Never do an OS
+block inside a task (`std.Thread.Mutex`, a blocking syscall, a busy `sleep`): it stalls **every** task
+multiplexed on that thread, not just yours — the classic coroutine-runtime footgun. *[zio]*
+
+### Detach for fire-and-forget; the handle is dead after
+
+For a server, spawn a handler per connection and `detach(rt)` to run it in the background — but after
+`detach`, the handle is invalid; don't touch it. If you care about the result or need to bound the
+lifetime, `join` (with the `defer cancel` idiom above) instead:
+
+```zig
+var task = try rt.spawn(connectionHandler, .{ rt, stream }, .{});
+task.detach(rt);   // runs in background; `task` is now off-limits
+```
+*[zio]*
+
+### `std.Io`: `async` vs `concurrent` — choose by whether correctness *requires* concurrency
+
+Below the task API sits the `std.Io` primitive pair. Both call `function` and return a `Future` you
+`await` later (`future.await(io)` / `future.cancel(io)`) — the difference is the **guarantee**, and it's
+a correctness decision, not a style one:
+
+- **`io.async(f, args) → Future(R)` — cannot fail.** *Weaker* guarantee: the function *may* run inline
+  (synchronously, before `async` returns) **or** be assigned a unit of concurrency. This is **portable** —
+  it works even on a single-threaded blocking `Io`. Use it when the result is correct either way and
+  concurrency is only an optimization. If the runtime can't spawn (resource exhaustion / shutdown), it
+  just runs the function inline — no error.
+- **`io.concurrent(f, args) → ConcurrentError!Future(R)` — can fail with `error.ConcurrencyUnavailable`.**
+  *Stronger* guarantee: the function makes progress **concurrently while the caller does other work /
+  awaits**. This **restricts** which `Io` implementations work (a single-threaded blocking `Io` cannot
+  provide it → the error). Use it **only when correctness requires** concurrency.
+
+The deadlock test decides it: if the caller `await`s something the spawned function must *produce while
+the caller is waiting*, you need `concurrent` — `async` could legally run it inline and deadlock.
+
+```zig
+// async — "run this too, I'll await it later"; may run inline; infallible
+var fut = io.async(fetch, .{ io, url });
+const local = computeLocally();
+const data = fut.await(io);
+
+// concurrent — "this MUST run while I await it"; you must handle the failure
+var producer = io.concurrent(produce, .{ io, queue }) catch |err| switch (err) {
+    error.ConcurrencyUnavailable => return err, // a single-threaded blocking Io can't run this pattern
+};
+const item = queue.getOne(io);  // would DEADLOCK if `produce` were allowed to run inline
+_ = producer.await(io);
+```
+
+**Rule of thumb:** default to `async` (portable, infallible); reach for `concurrent` *only* when you'd
+deadlock without real concurrency — and then you must handle `error.ConcurrencyUnavailable`.
+`error.ConcurrencyUnavailable` itself means resource exhaustion **or** the `Io` impl doesn't support
+concurrency. *[Zig stdlib]*
+
+(On a multi-task runtime like zio, both normally enqueue a task and return immediately; `async`'s inline
+fallback only kicks in when a task can't be spawned — resource exhaustion or shutdown.) *[zio]*
+
+### Cancelable vs cancellation-shielded blocking — `lock` vs `lockUncancelable`
+
+Blocking sync ops come in two forms. Note the pair is `lock` / **`lockUncancelable`** — the base `lock`
+is *already* the cancelable one, the suffix marks the shielded exception (there is no `lockCancelable`):
+
+- **`mutex.lock(rt) Cancelable!void` — a cancellation point.** If the task is canceled while waiting for
+  the lock, it cleanly leaves the wait queue and returns `error.Canceled`. This is the default: a task
+  blocked on a lock should stay cancelable. Propagate it: `try mutex.lock(rt)`.
+- **`mutex.lockUncancelable(rt) void` — cancellation-shielded, infallible.** It ignores cancellation
+  *during acquisition* and is guaranteed to return holding the lock. Use it in **critical / cleanup
+  sections that must complete regardless of cancellation** — exactly the paths that run *because* you're
+  being torn down (`defer …close(rt)`, releasing/posting). If you still need to react to a pending cancel
+  afterward, call `runtime.checkCanceled()`.
+
+Rule: **acquire-to-do-work → `lock` (cancelable); acquire-to-clean-up → `lockUncancelable`.** On a
+teardown path, `lock`'s `error.Canceled` has nowhere to go, and you must not bail out mid-cleanup.
+
+```zig
+// normal work — a task blocked here can still be canceled
+try mutex.lock(rt);
+defer mutex.unlock(rt);
+doWork();
+
+// cleanup path — must complete even though we're being canceled; don't reintroduce a cancel point
+fn close(self: *Conn, rt: *Runtime) void {
+    self.mutex.lockUncancelable(rt);  // shielded: cannot return error.Canceled
+    defer self.mutex.unlock(rt);
+    self.releaseResources();
+}
+```
+*[zio]* (std.Io mirrors this: `Mutex.lock` is `Cancelable!void`; `Mutex.lockUncancelable` is infallible.
+Same split shows up elsewhere as the `*Uncancelable` suffix, e.g. `Queue.getOneUncancelable`.)
