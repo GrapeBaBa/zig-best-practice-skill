@@ -1710,3 +1710,150 @@ fn close(self: *Conn, rt: *Runtime) void {
 ```
 *[zio]* (std.Io mirrors this: `Mutex.lock` is `Cancelable!void`; `Mutex.lockUncancelable` is infallible.
 Same split shows up elsewhere as the `*Uncancelable` suffix, e.g. `Queue.getOneUncancelable`.)
+
+## 12. Container Mutation & Pointer Invalidation
+
+The single most common Zig aliasing bug: iterating a container (or holding a `getPtr` value pointer
+/ an `.items` slice) while an operation **grows, rehashes, or removes** — which invalidates what you
+still hold. The contract is written into the std docs, per container:
+
+- `HashMap` / `AutoHashMap`: **"any modification invalidates live iterators"**, and every iterator
+  constructor repeats **"The iterator is invalidated if the map is modified."** There is no safe
+  in-place mutate-while-iterate. *[Zig stdlib — hash_map.zig:121, :238/:244/:250]*
+- `ArrayHashMap`: **"Modifying the hash map while iterating is allowed, however, one must understand
+  the (well defined) behavior when mixing insertions and deletions."** The `Iterator` *object* is still
+  invalidated (it caches raw `keys`/`values`/`len` — `array_hash_map.zig:749`), and `keys()`/`values()`
+  slices may be invalidated too; what is well-defined is an **index walk** over `.keys()` re-reading
+  `.count()` each step, because `swapRemoveAt` moves the **last** element into the freed slot.
+  *[Zig stdlib — array_hash_map.zig:73, :204, :1256]*
+- `ArrayList`: each method's doc says either **"Invalidates element pointers if additional memory is
+  needed"** (`append`) or **"Never invalidates element pointers"** (`appendAssumeCapacity`). Read that
+  line before holding a pointer across a call. *[Zig stdlib — array_list.zig:27, :250, :257]*
+
+**Runtime guardrail:** both maps embed a `pointer_stability: std.debug.SafetyLock`. In safe builds a
+growth op `.lock()`s it and pointer-returning ops `assertUnlocked()`, so a reentrant mutation through a
+held pointer **panics** instead of corrupting. Trust it in tests, don't rely on it in release.
+*[Zig stdlib — hash_map.zig:536, array_hash_map.zig:558, debug.zig:1705]*
+
+### Decision guide (in order)
+
+1. **Design it away** — make invalidation impossible, then no loop discipline is needed (below).
+2. **Index-walk + `swapRemove` (no advance)** — filtered in-place delete on a contiguous/indexable
+   container (`ArrayList`, `ArrayHashMap`).
+3. **Drain loop** — when the mutation *is* the iteration (consume the container to empty).
+4. **Detach / snapshot copy** — general fallback: iterate a copy that aliases none of the mutated
+   structure. Mandatory when the per-item op can **fail mid-loop** or when you delete a set *selected
+   from* the container being deleted from.
+5. **Two-phase mark-then-sweep** — when the delete *decision* must inspect **other** entries, or you
+   remove from container B while iterating container A.
+
+### 1. Design it away (preferred)
+
+**Static capacity → no rehash/realloc → pointers & iterators stable by construction.** Reserve once at
+init (where OOM is handled), then use the `*AssumeCapacity` ops at runtime (see §2 for the mechanics).
+Because the backing array never moves, held pointers and in-flight iterators stay valid:
+
+```zig
+// init: reserve for the whole lifetime
+try stash.ensureTotalCapacity(allocator, options.stash_value_count_max);
+// hot path: cannot rehash → cannot invalidate. (getOrPutAssumeCapacity, not
+// putAssumeCapacity, because a Value-less HashMap's putAssumeCapacity won't clobber.)
+const gop = self.stash.getOrPutAssumeCapacity(value.*);
+```
+TigerBeetle reserves at init and `*AssumeCapacity`s in the hot path pervasively — `cache_map.zig`,
+`client_sessions.zig` (`ensureTotalCapacity(clients_max)` then `getOrPutAssumeCapacity`),
+`manifest_log.zig` (reserves `+1` *specifically* so the code can always use `getOrPutAssumeCapacity`).
+*[TigerBeetle — src/lsm/cache_map.zig:110 & :269, src/vsr/client_sessions.zig:54 & :239, src/lsm/manifest_log.zig:190]*
+
+**Pointer-stable containers** side-step the whole problem — elements never move on growth:
+- **Intrusive linked lists** (nodes externally owned, linked by an embedded `next`): grow/shrink is
+  O(1) and never relocates. *[TigerBeetle — src/stack.zig:13, src/queue.zig:6]* (see also §7)
+- **Object pools / free lists** hand out stable addresses reused via `create`/`destroy`.
+  Ghostty's `SegmentedPool` doc states the motivation outright: *"stable (never copied) pointers to a
+  type that automatically grows."* *[Ghostty — src/datastruct/segmented_pool.zig:6; src/terminal/PageList.zig:51 (MemoryPool nodes/pages/pins)]*
+- **Offset-based containers**: store offsets, not pointers, so the backing memory can move without
+  invalidating anything — Ghostty's `OffsetHashMap` exists solely for this. *[Ghostty — src/terminal/hash_map.zig:60]*
+
+(Note: `std.SegmentedList` — historically the go-to for stable element pointers across growth — is **not
+present** in this std (0.16). Reach for the pool / intrusive-list / offset options above instead.)
+
+### 2. Index-walk + `swapRemove` (no advance on removal)
+
+Delete-in-place by a predicate. Walk an index; on a match `swapRemove(i)` (moves the last element into
+slot `i`) and **do not advance** — the swapped-in element must be re-examined; advance only on a keep:
+
+```zig
+var i: usize = 0;
+while (i < p.labels.items.len) {
+    if (p.labels.items[i] == .unresolved_goto and mem.eql(u8, ..., str)) {
+        _ = p.labels.swapRemove(i);   // last elem moves into i; DON'T advance
+    } else i += 1;
+}
+```
+This is the canonical form in the Zig compiler's aro parser, in TigerBeetle production (the repair-budget
+expiry reaper walks `requested_prepares.entries.len` and `swapRemoveAt(i)` with `i += 1` only in the
+`else`), and in Ghostty (`swapRemove(i); continue;` with a trailing `i += 1`). Use `orderedRemove` +
+`i -= 1` instead when insertion order must be preserved (Ghostty's `Atlas`).
+*[Zig stdlib — compiler/aro/aro/Parser.zig:5331; TigerBeetle — src/vsr/repair_budget.zig:220; Ghostty — src/App.zig:198, src/font/Atlas.zig:194]*
+
+### 3. Drain loop (the mutation *is* the iteration)
+
+When you want to consume the container to empty, let the removal drive the loop — there is no surviving
+iterator to invalidate:
+
+```zig
+while (queue.pop()) |item| { ...; message_pool.unref(item.message); }   // consume to empty
+while (map.count() > 0) try context.release();                          // take-first-then-remove
+```
+Widely used: TigerBeetle drains intrusive queues/stacks in `deinit` and checkpoint paths; the Zig
+compiler drains stacks with `while (stack.pop()) |s|`. Prefer this over a re-scan-for-the-next-victim
+loop: if a delete can be *swallowed*, a re-scan re-selects the same victim and **spins forever** — a
+drain (or the index-walk in #2) makes guaranteed forward progress.
+*[TigerBeetle — src/vsr/replica.zig:12128, src/vsr/free_set.zig:613, src/lsm/node_pool.zig:199; Zig stdlib — compiler/build_runner.zig:1458, compiler/aro/aro/Preprocessor.zig:2873]*
+
+### 4. Detach / snapshot copy (general fallback)
+
+Iterate a copy that aliases none of the structure you mutate. The minimal form copies **one element**
+by value before an op that invalidates the live one; the general form `dupe`s the driving list:
+
+```zig
+// minimal: copy the element, THEN remove (remove_table would invalidate level_table)
+while (it.next()) |level_table| {
+    var level_table_copy = level_table.*;
+    env.level.remove_table(&env.pool, &level_table_copy);
+}
+
+// general: snapshot the keys, then the loop body may freely mutate index + map
+const snapshot = try allocator.dupe(Root, list.items);
+defer allocator.free(snapshot);
+for (snapshot) |root| { ...; self.removeEntry(.{ .root = root, .epoch = epoch }); }
+```
+Choose this when the per-item op **can throw** (a mid-loop failure leaves the not-yet-processed entries
+still tracked in the live container, so a retry loses nothing) or when the delete set is *selected from*
+the container. Cost is one small alloc — negligible off the hot path.
+*[TigerBeetle — src/lsm/manifest_level_fuzz.zig:448]*
+
+### 5. Two-phase mark-then-sweep
+
+When the delete *decision* must look at **other** entries (so you can't remove during the scan), or you
+mutate container B while iterating container A: collect victims into a temp list in phase 1, apply in
+phase 2 after the iterator is done.
+
+```zig
+// phase 1 — MARK: scan, collect, mutate nothing
+var candidates: std.ArrayList(Candidate) = .empty;
+defer candidates.deinit(alloc);
+var it = self.images.iterator();
+while (it.next()) |kv| try candidates.append(alloc, .{ .id = kv.value_ptr.id, ... });
+
+// phase 2 — SWEEP: now safe to remove
+for (candidates.items) |c| {
+    if (self.images.getEntry(c.id)) |entry| self.images.removeByPtr(entry.key_ptr);
+}
+```
+Ghostty uses exactly this for image eviction and env-var filtering. When a single removal *doesn't* need
+cross-entry context, `HashMap.removeByPtr(kv.key_ptr)` during a `valueIterator`/`entryIterator` walk is
+the lighter tool (it removes the current entry without a temp list). And a plain comment can carry the
+intent — Ghostty picks `while` over `for` "because we may add items to the list while iterating," and
+notes "getOrPut invalidates pointers" right where it nulls a cached pointer.
+*[Ghostty — src/terminal/kitty/graphics_storage.zig:529 & :586, src/apprt/gtk/class/surface.zig:1595, src/config/Config.zig:4165, src/input/Binding.zig:2475]*
