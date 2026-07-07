@@ -1857,3 +1857,97 @@ the lighter tool (it removes the current entry without a temp list). And a plain
 intent — Ghostty picks `while` over `for` "because we may add items to the list while iterating," and
 notes "getOrPut invalidates pointers" right where it nulls a cached pointer.
 *[Ghostty — src/terminal/kitty/graphics_storage.zig:529 & :586, src/apprt/gtk/class/surface.zig:1595, src/config/Config.zig:4165, src/input/Binding.zig:2475]*
+
+## 13. State Across Suspension Points (async re-lookup)
+
+The async analog of §12: a **suspension point** — any call taking `std.Io` (or a zio fiber op) that
+can park the fiber — is a point where *other tasks run*. Single-threaded async removes data races,
+not suspension races: a pointer into shared state (`getPtr` result, `.items` slice, an entry you
+"checked" before the call) may be stale or dangling when the fiber resumes, because a racing task
+mutated, pruned, or replaced it while you were parked. The danger is not "simultaneously" — it is
+"the world moved while I was suspended, and my pointer + ownership assumptions didn't".
+
+**The criterion (judge every suspending call):** does a live borrow into shared mutable state, or a
+multi-step mutation sequence, **cross** the suspension point? Not "is this an io call":
+- *read-then-build* (fetch keys, then construct state nothing else aliases yet) — fine as written.
+- *check-or-hold, suspend, then act on what you held* — the hazard; pick a shape below.
+
+Rust makes the "hold" half a compile error (`clippy::await_holding_lock`: std/parking_lot guards
+"are not designed to operate in an async context across await points"). Zig has no such lint —
+this is a review-time check.
+
+### Decision guide (in order)
+
+1. **Don't suspend inside the state change** — mutate synchronously, push I/O to the edge.
+2. **Serialize the operation** (waiter/placeholder, per-key exclusivity) — only when the guarded
+   work is *short* (an init computation), never across long I/O.
+3. **Re-lookup after resume + explicit conflict policy** — when the operation must do long I/O
+   mid-flight (a disk write/read), capture the *key*, suspend, re-fetch by key, decide from what is
+   there *now*.
+
+### 1. Don't suspend inside the state change (preferred)
+
+All cache/map mutation happens in synchronous code; the suspending call sits between two
+synchronous phases and mutates nothing itself. tokio's teaching codebase mini-redis is built on
+this: the shared `Db` uses a *blocking* mutex never held across an await — `set()` does
+`drop(state)` before notifying the background task, and the purge loop re-acquires fresh state
+each iteration, awaiting only outside the critical section. The Tokio tutorial states the rule
+outright: "the lock must be released before the `.await`." TigerBeetle is the strongest form: the
+VSR state machine never suspends at all — I/O completions re-enter as ordinary events, so no state
+ever crosses a yield (sans-IO). *[mini-redis — src/db.rs set()/purge_expired_tasks(); tokio.rs
+tutorial "Shared state"; TigerBeetle — docs/internals/vsr.md]*
+
+### 2. Serialize the operation (short critical work only)
+
+First task claims the key (inserts a waiter/permit), racers wait for its result instead of racing.
+tokio's `OnceCell.get_or_init` holds a semaphore permit across the init future — after acquiring,
+it just asserts uninitialized and runs, because the permit guarantees exclusivity. moka's
+`get_with` coalesces concurrent same-key loads through a waiter map the same way. *[tokio —
+src/sync/once_cell.rs get_or_try_init; moka — src/future/value_initializer.rs try_insert_waiter]*
+
+Two hard limits: (a) exclusivity across a *long* I/O (a multi-hundred-ms disk write) queues every
+other op on that key behind the disk — wrong for hot paths; (b) coalescing dedups *same-intent*
+work ("N tasks all fetching missing key K") but cannot arbitrate *conflicting intents* (persist vs
+add vs prune on one key) — those need shape 3.
+
+### 3. Re-lookup after resume + explicit conflict policy
+
+Capture the **key** (a value copy — per §12, never a pointer) before suspending; after resume,
+re-fetch by key and decide from current state: last-writer-wins (overwrite/downgrade whatever is
+resident now), first-writer-wins (adopt the existing value, discard your work), or abandon (entry
+vanished → clean up your side effect). The re-lookup is application semantics — no ownership
+mechanism (GC, refcount, borrow checker) can answer "what should the entry be now?".
+
+```zig
+const key = try self.datastore.write(io, cp_key, bytes); // suspends; the world may change
+// Re-lookup by key; never touch the pre-write entry pointer again.
+const cur = self.cache.getPtr(cp_key) orelse {
+    self.datastore.remove(io, key) catch |err| log.warn(...); // vanished: undo side effect
+    return;
+};
+switch (cur.item) {
+    .in_memory => |im| { cur.item = .{ .persisted = key }; destroyState(im.state); }, // LWW
+    .persisted => {}, // racer already persisted: no-op
+}
+```
+*[lodestar-z — src/beacon_node/chain/state_cache/checkpoint_state_cache.zig processPastEpoch]*
+
+The same shape, independent of language and of thread-vs-task concurrency:
+- moka re-checks the cache after its coordination await — "Check if the value has already been
+  inserted by other thread." → `get_with_hash` re-fetch → `ReadExisting(value)` (first-writer-wins).
+  *[moka @ 7006d8c9 — src/future/value_initializer.rs:191, :223-233]*
+- ScyllaDB parks a range scan by *copying the key* (`_prev_snapshot_pos = it->key()`) and re-seeks
+  with `lower_bound` on resume — never trusts the pre-yield iterator, and documents why:
+  "restore invariants before deferring". *[scylladb @ 373085cd — db/row_cache.cc:1269, :1250, :1088]*
+- Reth validates a transaction against a state snapshot (async), then takes the pool lock and
+  inserts *re-checked against the pool's current state* (replacement/underpriced/already-known).
+  *[reth @ 1a4a5c96 — crates/transaction-pool/src/pool/mod.rs:578, :617]*
+
+### Testing suspension races
+
+Interleave scenarios need **real suspension**, not synchronous re-entry through a vtable: a
+single-threaded runtime, a gated I/O fake that parks the op on `std.Io.Event`, and a rendezvous
+sequence witness asserting the order actually interleaved (`parked < racer_done < resumed`).
+Same-stack re-entry reproduces the memory outcome but not the control flow — it cannot catch state
+held across a true park. *[lodestar-z — checkpoint_state_cache.zig GatedCPStateDatastore +
+Rendezvous tests; zio single-threaded `Runtime.init(.{ .executors = .exact(1) })`]*
