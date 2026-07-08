@@ -1710,3 +1710,244 @@ fn close(self: *Conn, rt: *Runtime) void {
 ```
 *[zio]* (std.Io mirrors this: `Mutex.lock` is `Cancelable!void`; `Mutex.lockUncancelable` is infallible.
 Same split shows up elsewhere as the `*Uncancelable` suffix, e.g. `Queue.getOneUncancelable`.)
+
+## 12. Container Mutation & Pointer Invalidation
+
+The single most common Zig aliasing bug: iterating a container (or holding a `getPtr` value pointer
+/ an `.items` slice) while an operation **grows, rehashes, or removes** — which invalidates what you
+still hold. The contract is written into the std docs, per container:
+
+- `HashMap` / `AutoHashMap`: **"any modification invalidates live iterators"**, and every iterator
+  constructor repeats **"The iterator is invalidated if the map is modified."** There is no safe
+  in-place mutate-while-iterate. *[Zig stdlib — hash_map.zig:121, :238/:244/:250]*
+- `ArrayHashMap`: **"Modifying the hash map while iterating is allowed, however, one must understand
+  the (well defined) behavior when mixing insertions and deletions."** The `Iterator` *object* is still
+  invalidated (it caches raw `keys`/`values`/`len` — `array_hash_map.zig:749`), and `keys()`/`values()`
+  slices may be invalidated too; what is well-defined is an **index walk** over `.keys()` re-reading
+  `.count()` each step, because `swapRemoveAt` moves the **last** element into the freed slot.
+  *[Zig stdlib — array_hash_map.zig:73, :204, :1256]*
+- `ArrayList`: each method's doc says either **"Invalidates element pointers if additional memory is
+  needed"** (`append`) or **"Never invalidates element pointers"** (`appendAssumeCapacity`). Read that
+  line before holding a pointer across a call. *[Zig stdlib — array_list.zig:27, :250, :257]*
+
+**Runtime guardrail:** both maps embed a `pointer_stability: std.debug.SafetyLock`. In safe builds a
+growth op `.lock()`s it and pointer-returning ops `assertUnlocked()`, so a reentrant mutation through a
+held pointer **panics** instead of corrupting. Trust it in tests, don't rely on it in release.
+*[Zig stdlib — hash_map.zig:536, array_hash_map.zig:558, debug.zig:1705]*
+
+### Decision guide (in order)
+
+1. **Design it away** — make invalidation impossible, then no loop discipline is needed (below).
+2. **Index-walk + `swapRemove` (no advance)** — filtered in-place delete on a contiguous/indexable
+   container (`ArrayList`, `ArrayHashMap`).
+3. **Drain loop** — when the mutation *is* the iteration (consume the container to empty).
+4. **Detach / snapshot copy** — general fallback: iterate a copy that aliases none of the mutated
+   structure. Mandatory when the per-item op can **fail mid-loop** or when you delete a set *selected
+   from* the container being deleted from.
+5. **Two-phase mark-then-sweep** — when the delete *decision* must inspect **other** entries, or you
+   remove from container B while iterating container A.
+
+### 1. Design it away (preferred)
+
+**Static capacity → no rehash/realloc → pointers & iterators stable by construction.** Reserve once at
+init (where OOM is handled), then use the `*AssumeCapacity` ops at runtime (see §2 for the mechanics).
+Because the backing array never moves, held pointers and in-flight iterators stay valid:
+
+```zig
+// init: reserve for the whole lifetime
+try stash.ensureTotalCapacity(allocator, options.stash_value_count_max);
+// hot path: cannot rehash → cannot invalidate. (getOrPutAssumeCapacity, not
+// putAssumeCapacity, because a Value-less HashMap's putAssumeCapacity won't clobber.)
+const gop = self.stash.getOrPutAssumeCapacity(value.*);
+```
+TigerBeetle reserves at init and `*AssumeCapacity`s in the hot path pervasively — `cache_map.zig`,
+`client_sessions.zig` (`ensureTotalCapacity(clients_max)` then `getOrPutAssumeCapacity`),
+`manifest_log.zig` (reserves `+1` *specifically* so the code can always use `getOrPutAssumeCapacity`).
+*[TigerBeetle — src/lsm/cache_map.zig:110 & :269, src/vsr/client_sessions.zig:54 & :239, src/lsm/manifest_log.zig:190]*
+
+**Pointer-stable containers** side-step the whole problem — elements never move on growth:
+- **Intrusive linked lists** (nodes externally owned, linked by an embedded `next`): grow/shrink is
+  O(1) and never relocates. *[TigerBeetle — src/stack.zig:13, src/queue.zig:6]* (see also §7)
+- **Object pools / free lists** hand out stable addresses reused via `create`/`destroy`.
+  Ghostty's `SegmentedPool` doc states the motivation outright: *"stable (never copied) pointers to a
+  type that automatically grows."* *[Ghostty — src/datastruct/segmented_pool.zig:6; src/terminal/PageList.zig:51 (MemoryPool nodes/pages/pins)]*
+- **Offset-based containers**: store offsets, not pointers, so the backing memory can move without
+  invalidating anything — Ghostty's `OffsetHashMap` exists solely for this. *[Ghostty — src/terminal/hash_map.zig:60]*
+
+(Note: `std.SegmentedList` — historically the go-to for stable element pointers across growth — is **not
+present** in this std (0.16). Reach for the pool / intrusive-list / offset options above instead.)
+
+### 2. Index-walk + `swapRemove` (no advance on removal)
+
+Delete-in-place by a predicate. Walk an index; on a match `swapRemove(i)` (moves the last element into
+slot `i`) and **do not advance** — the swapped-in element must be re-examined; advance only on a keep:
+
+```zig
+var i: usize = 0;
+while (i < p.labels.items.len) {
+    if (p.labels.items[i] == .unresolved_goto and mem.eql(u8, ..., str)) {
+        _ = p.labels.swapRemove(i);   // last elem moves into i; DON'T advance
+    } else i += 1;
+}
+```
+This is the canonical form in the Zig compiler's aro parser, in TigerBeetle production (the repair-budget
+expiry reaper walks `requested_prepares.entries.len` and `swapRemoveAt(i)` with `i += 1` only in the
+`else`), and in Ghostty (`swapRemove(i); continue;` with a trailing `i += 1`). Use `orderedRemove` +
+`i -= 1` instead when insertion order must be preserved (Ghostty's `Atlas`).
+*[Zig stdlib — compiler/aro/aro/Parser.zig:5331; TigerBeetle — src/vsr/repair_budget.zig:220; Ghostty — src/App.zig:198, src/font/Atlas.zig:194]*
+
+### 3. Drain loop (the mutation *is* the iteration)
+
+When you want to consume the container to empty, let the removal drive the loop — there is no surviving
+iterator to invalidate:
+
+```zig
+while (queue.pop()) |item| { ...; message_pool.unref(item.message); }   // consume to empty
+while (map.count() > 0) try context.release();                          // take-first-then-remove
+```
+Widely used: TigerBeetle drains intrusive queues/stacks in `deinit` and checkpoint paths; the Zig
+compiler drains stacks with `while (stack.pop()) |s|`. Prefer this over a re-scan-for-the-next-victim
+loop: if a delete can be *swallowed*, a re-scan re-selects the same victim and **spins forever** — a
+drain (or the index-walk in #2) makes guaranteed forward progress.
+*[TigerBeetle — src/vsr/replica.zig:12128, src/vsr/free_set.zig:613, src/lsm/node_pool.zig:199; Zig stdlib — compiler/build_runner.zig:1458, compiler/aro/aro/Preprocessor.zig:2873]*
+
+### 4. Detach / snapshot copy (general fallback)
+
+Iterate a copy that aliases none of the structure you mutate. The minimal form copies **one element**
+by value before an op that invalidates the live one; the general form `dupe`s the driving list:
+
+```zig
+// minimal: copy the element, THEN remove (remove_table would invalidate level_table)
+while (it.next()) |level_table| {
+    var level_table_copy = level_table.*;
+    env.level.remove_table(&env.pool, &level_table_copy);
+}
+
+// general: snapshot the keys, then the loop body may freely mutate index + map
+const snapshot = try allocator.dupe(Root, list.items);
+defer allocator.free(snapshot);
+for (snapshot) |root| { ...; self.removeEntry(.{ .root = root, .epoch = epoch }); }
+```
+Choose this when the per-item op **can throw** (a mid-loop failure leaves the not-yet-processed entries
+still tracked in the live container, so a retry loses nothing) or when the delete set is *selected from*
+the container. Cost is one small alloc — negligible off the hot path.
+*[TigerBeetle — src/lsm/manifest_level_fuzz.zig:448]*
+
+### 5. Two-phase mark-then-sweep
+
+When the delete *decision* must look at **other** entries (so you can't remove during the scan), or you
+mutate container B while iterating container A: collect victims into a temp list in phase 1, apply in
+phase 2 after the iterator is done.
+
+```zig
+// phase 1 — MARK: scan, collect, mutate nothing
+var candidates: std.ArrayList(Candidate) = .empty;
+defer candidates.deinit(alloc);
+var it = self.images.iterator();
+while (it.next()) |kv| try candidates.append(alloc, .{ .id = kv.value_ptr.id, ... });
+
+// phase 2 — SWEEP: now safe to remove
+for (candidates.items) |c| {
+    if (self.images.getEntry(c.id)) |entry| self.images.removeByPtr(entry.key_ptr);
+}
+```
+Ghostty uses exactly this for image eviction and env-var filtering. When a single removal *doesn't* need
+cross-entry context, `HashMap.removeByPtr(kv.key_ptr)` during a `valueIterator`/`entryIterator` walk is
+the lighter tool (it removes the current entry without a temp list). And a plain comment can carry the
+intent — Ghostty picks `while` over `for` "because we may add items to the list while iterating," and
+notes "getOrPut invalidates pointers" right where it nulls a cached pointer.
+*[Ghostty — src/terminal/kitty/graphics_storage.zig:529 & :586, src/apprt/gtk/class/surface.zig:1595, src/config/Config.zig:4165, src/input/Binding.zig:2475]*
+
+## 13. State Across Suspension Points (async re-lookup)
+
+The async analog of §12: a **suspension point** — any call taking `std.Io` (or a zio fiber op) that
+can park the fiber — is a point where *other tasks run*. Single-threaded async removes data races,
+not suspension races: a pointer into shared state (`getPtr` result, `.items` slice, an entry you
+"checked" before the call) may be stale or dangling when the fiber resumes, because a racing task
+mutated, pruned, or replaced it while you were parked. The danger is not "simultaneously" — it is
+"the world moved while I was suspended, and my pointer + ownership assumptions didn't".
+
+**The criterion (judge every suspending call):** does a live borrow into shared mutable state, or a
+multi-step mutation sequence, **cross** the suspension point? Not "is this an io call":
+- *read-then-build* (fetch keys, then construct state nothing else aliases yet) — fine as written.
+- *check-or-hold, suspend, then act on what you held* — the hazard; pick a shape below.
+
+Rust makes the "hold" half a compile error (`clippy::await_holding_lock`: std/parking_lot guards
+"are not designed to operate in an async context across await points"). Zig has no such lint —
+this is a review-time check.
+
+### Decision guide (in order)
+
+1. **Don't suspend inside the state change** — mutate synchronously, push I/O to the edge.
+2. **Serialize the operation** (waiter/placeholder, per-key exclusivity) — only when the guarded
+   work is *short* (an init computation), never across long I/O.
+3. **Re-lookup after resume + explicit conflict policy** — when the operation must do long I/O
+   mid-flight (a disk write/read), capture the *key*, suspend, re-fetch by key, decide from what is
+   there *now*.
+
+### 1. Don't suspend inside the state change (preferred)
+
+All cache/map mutation happens in synchronous code; the suspending call sits between two
+synchronous phases and mutates nothing itself. tokio's teaching codebase mini-redis is built on
+this: the shared `Db` uses a *blocking* mutex never held across an await — `set()` does
+`drop(state)` before notifying the background task, and the purge loop re-acquires fresh state
+each iteration, awaiting only outside the critical section. The Tokio tutorial states the rule
+outright: "the lock must be released before the `.await`." TigerBeetle is the strongest form: the
+VSR state machine never suspends at all — I/O completions re-enter as ordinary events, so no state
+ever crosses a yield (sans-IO). *[mini-redis — src/db.rs set()/purge_expired_tasks(); tokio.rs
+tutorial "Shared state"; TigerBeetle — docs/internals/vsr.md]*
+
+### 2. Serialize the operation (short critical work only)
+
+First task claims the key (inserts a waiter/permit), racers wait for its result instead of racing.
+tokio's `OnceCell.get_or_init` holds a semaphore permit across the init future — after acquiring,
+it just asserts uninitialized and runs, because the permit guarantees exclusivity. moka's
+`get_with` coalesces concurrent same-key loads through a waiter map the same way. *[tokio —
+src/sync/once_cell.rs get_or_try_init; moka — src/future/value_initializer.rs try_insert_waiter]*
+
+Two hard limits: (a) exclusivity across a *long* I/O (a multi-hundred-ms disk write) queues every
+other op on that key behind the disk — wrong for hot paths; (b) coalescing dedups *same-intent*
+work ("N tasks all fetching missing key K") but cannot arbitrate *conflicting intents* (persist vs
+add vs prune on one key) — those need shape 3.
+
+### 3. Re-lookup after resume + explicit conflict policy
+
+Capture the **key** (a value copy — per §12, never a pointer) before suspending; after resume,
+re-fetch by key and decide from current state: last-writer-wins (overwrite/downgrade whatever is
+resident now), first-writer-wins (adopt the existing value, discard your work), or abandon (entry
+vanished → clean up your side effect). The re-lookup is application semantics — no ownership
+mechanism (GC, refcount, borrow checker) can answer "what should the entry be now?".
+
+```zig
+const key = try self.datastore.write(io, cp_key, bytes); // suspends; the world may change
+// Re-lookup by key; never touch the pre-write entry pointer again.
+const cur = self.cache.getPtr(cp_key) orelse {
+    self.datastore.remove(io, key) catch |err| log.warn(...); // vanished: undo side effect
+    return;
+};
+switch (cur.item) {
+    .in_memory => |im| { cur.item = .{ .persisted = key }; destroyState(im.state); }, // LWW
+    .persisted => {}, // racer already persisted: no-op
+}
+```
+*[lodestar-z — src/beacon_node/chain/state_cache/checkpoint_state_cache.zig processPastEpoch]*
+
+The same shape, independent of language and of thread-vs-task concurrency:
+- moka re-checks the cache after its coordination await — "Check if the value has already been
+  inserted by other thread." → `get_with_hash` re-fetch → `ReadExisting(value)` (first-writer-wins).
+  *[moka @ 7006d8c9 — src/future/value_initializer.rs:191, :223-233]*
+- ScyllaDB parks a range scan by *copying the key* (`_prev_snapshot_pos = it->key()`) and re-seeks
+  with `lower_bound` on resume — never trusts the pre-yield iterator, and documents why:
+  "restore invariants before deferring". *[scylladb @ 373085cd — db/row_cache.cc:1269, :1250, :1088]*
+- Reth validates a transaction against a state snapshot (async), then takes the pool lock and
+  inserts *re-checked against the pool's current state* (replacement/underpriced/already-known).
+  *[reth @ 1a4a5c96 — crates/transaction-pool/src/pool/mod.rs:578, :617]*
+
+### Testing suspension races
+
+Interleave scenarios need **real suspension**, not synchronous re-entry through a vtable: a
+single-threaded runtime, a gated I/O fake that parks the op on `std.Io.Event`, and a rendezvous
+sequence witness asserting the order actually interleaved (`parked < racer_done < resumed`).
+Same-stack re-entry reproduces the memory outcome but not the control flow — it cannot catch state
+held across a true park. *[lodestar-z — checkpoint_state_cache.zig GatedCPStateDatastore +
+Rendezvous tests; zio single-threaded `Runtime.init(.{ .executors = .exact(1) })`]*
