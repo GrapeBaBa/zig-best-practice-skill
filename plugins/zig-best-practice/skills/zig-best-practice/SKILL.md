@@ -37,6 +37,31 @@ pub fn init(allocator: Allocator) error{OutOfMemory}!Self {
 If `Cache.init` fails, `index.deinit` runs. If `allocator.alloc` fails, both
 `cache.deinit` and `index.deinit` run. No leaks in any failure path. *[TigerBeetle]*
 
+### Commit Barriers: Keep the Rest of the Scope Infallible
+
+After ownership or initialized state is committed, earlier `errdefer` cleanup may
+become invalid. Mark that boundary with `errdefer comptime unreachable;` when all
+remaining work must stay infallible:
+
+```zig
+try globals.pool.init(allocator);
+errdefer globals.pool.deinit(allocator);
+
+try globals.index.init(allocator);
+errdefer globals.index.deinit(allocator);
+
+globals.ready = true; // The initialized state is now published.
+errdefer comptime unreachable;
+
+finishInitializationInfallible();
+```
+
+This is a compile-time tripwire, not cleanup. A later `try`, `return error.X`, or
+other reachable error return makes compilation fail, forcing the ownership and
+rollback design to be reconsidered instead of silently running stale cleanup and
+risking a double-free or rollback of committed state. Keep the barrier immediately
+after the commit point. *[Mitchell Hashimoto](https://x.com/mitchellh/status/1998119357793403118)*
+
 ### Loop errdefer: Partial Array Cleanup
 
 When initializing array elements one by one, `errdefer` must clean up `[0..i]`:
