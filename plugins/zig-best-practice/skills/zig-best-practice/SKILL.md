@@ -1,6 +1,6 @@
 ---
 name: zig-best-practice
-description: General Zig best practices for memory safety, error handling, comptime patterns, memory layout, and concurrency (atomics/lock-free and structured async / coroutine tasks). Use when writing, modifying, or reviewing any .zig code in any project, including async I/O and task-based concurrency.
+description: Zig 0.16.0 best practices for memory safety, error handling, comptime patterns, memory layout, and concurrency. Use when writing, modifying, or reviewing Zig 0.16.0 code, including std.Io and task-based concurrency.
 ---
 
 # Zig Best Practices
@@ -8,12 +8,21 @@ description: General Zig best practices for memory safety, error handling, compt
 Patterns for writing safe, performant, and maintainable Zig code. Derived from production
 systems programming and the Zig standard library design.
 
+## Version and API Verification
+
+This skill targets **Zig 0.16.0**. Before recommending a standard-library API, run `zig env`
+and verify its signature in the installed `.std_dir`; do not carry forward an older API just
+because the name still appears in an earlier codebase. In particular, use the 0.16 `std.Io`
+file/runtime interfaces, the allocator-explicit `std.ArrayList`, and the replacement type
+construction builtins such as `@Enum` and `@Struct`.
+
 ## 1. Memory Safety
 
-### errdefer Chains: Every `try` Gets an `errdefer`
+### errdefer Chains: Protect Every Acquired Resource
 
-When initializing multiple resources, each `try` must have a matching `errdefer` that
-cleans up on failure. This prevents leaks when a later initialization fails:
+When initializing multiple owned resources, protect each successful acquisition with an
+immediate `errdefer` before the next fallible operation. A `try` that acquires no resource
+does not need cleanup.
 
 ```zig
 pub fn init(allocator: Allocator) error{OutOfMemory}!Self {
@@ -23,7 +32,7 @@ pub fn init(allocator: Allocator) error{OutOfMemory}!Self {
     var cache = try Cache.init(allocator, .{ ... });
     errdefer cache.deinit(allocator);
 
-    var buffer = try allocator.alloc(u8, size);
+    const buffer = try allocator.alloc(u8, size);
     errdefer allocator.free(buffer);
 
     return Self{
@@ -86,7 +95,7 @@ When a struct must live on the heap (e.g., for pointer stability or self-referen
 separate allocation from initialization:
 
 ```zig
-var pool = try allocator.create(MessagePool);
+const pool = try allocator.create(MessagePool);
 errdefer allocator.destroy(pool);
 
 pool.* = try MessagePool.init(allocator, options);
@@ -103,15 +112,17 @@ When a resource is conditionally acquired, declare it as `null` with an immediat
 `defer if`:
 
 ```zig
-var trace_file: ?std.fs.File = null;
-defer if (trace_file) |file| file.close();
+fn run(io: std.Io, options: Options, allocator: Allocator) !void {
+    var trace_file: ?std.Io.File = null;
+    defer if (trace_file) |file| file.close(io);
 
-var exe_path: ?[:0]const u8 = null;
-defer if (exe_path) |path| allocator.free(path);
+    var exe_path: ?[:0]const u8 = null;
+    defer if (exe_path) |path| allocator.free(path);
 
-// Later, conditionally assign:
-if (options.trace) |trace_path| {
-    trace_file = try std.fs.cwd().createFile(trace_path, .{});
+    // Later, conditionally assign:
+    if (options.trace) |trace_path| {
+        trace_file = try std.Io.Dir.cwd().createFile(io, trace_path, .{});
+    }
 }
 ```
 
@@ -121,8 +132,8 @@ sees the final value, so cleanup runs only if the resource was actually acquired
 
 ### Deinit Reversal and Poisoning
 
-Deinitialization must reverse initialization order. Poison memory after free to
-catch use-after-free:
+Deinitialization must reverse initialization order. Assigning `undefined` after cleanup can help
+safe builds expose accidental reuse, but it is not a runtime guarantee in optimized builds:
 
 ```zig
 pub fn deinit(self: *Self, allocator: Allocator) void {
@@ -309,11 +320,11 @@ Combine error sets from different sources into a single union:
 
 ```zig
 // Merge related error sets
-const IoError = std.posix.ReadError || std.posix.WriteError;
+const IoError = std.Io.Reader.Error || std.Io.Writer.Error;
 
 // Compose domain errors with system errors
 const WatcherError = std.mem.Allocator.Error ||
-    std.posix.KQueueError ||
+    std.Io.ConcurrentError ||
     std.Thread.SpawnError;
 
 // Merge across backend implementations
@@ -601,27 +612,24 @@ const timeout: u64 = timeout: {
 ```
 *[TigerBeetle]*
 
-### Dynamic Type Construction with `@Type`
+### Dynamic Type Construction with Dedicated Builtins
 
 Build types from comptime data:
 
 ```zig
 const MyEnum = blk: {
-    var fields: []const std.builtin.Type.EnumField = &.{};
+    var field_names: [config.items.len][:0]const u8 = undefined;
+    var field_values: [config.items.len]u32 = undefined;
     for (config.items, 0..) |item, i| {
-        fields = fields ++ &[_]std.builtin.Type.EnumField{.{
-            .name = item.name,
-            .value = i,
-        }};
+        field_names[i] = item.name;
+        field_values[i] = @intCast(i);
     }
-    break :blk @Type(.{ .@"enum" = .{
-        .tag_type = u32,
-        .fields = fields,
-        .decls = &.{},
-        .is_exhaustive = true,
-    } });
+    break :blk @Enum(u32, .exhaustive, &field_names, &field_values);
 };
 ```
+
+`@Type` was removed in Zig 0.16.0. Use the dedicated builtin matching the type being
+constructed: `@Enum`, `@Struct`, `@Union`, `@Pointer`, `@Fn`, `@Int`, or `@Tuple`.
 *[TigerBeetle, libxev]*
 
 ### `@hasDecl` / `@hasField` for Compile-Time Interface Checking
@@ -634,10 +642,10 @@ pub fn Cow(comptime T: type, comptime VTable: type) type {
         borrowed: *const T,
         owned: T,
 
-        fn copy(this: *const T, allocator: Allocator) T {
+        fn copy(this: *const T, allocator: Allocator) Allocator.Error!T {
             if (!@hasDecl(VTable, "copy"))
                 @compileError(@typeName(VTable) ++ " needs `copy()` function");
-            return VTable.copy(this, allocator);
+            return try VTable.copy(this, allocator);
         }
     };
 }
@@ -681,9 +689,10 @@ pub fn Loop(comptime backend: Backend) type {
 ```
 *[libxev]*
 
-### Compile-Time Configuration-Driven Composition
+### Compile-Time Configuration-Driven Behavior
 
-Use options structs with comptime parameters to selectively enable features:
+Use comptime options to specialize behavior. `usingnamespace` was removed in Zig 0.16.0;
+keep the method declaration explicit and reject disabled operations at comptime:
 
 ```zig
 pub const StreamOptions = struct {
@@ -697,10 +706,12 @@ pub const StreamOptions = struct {
 
 pub fn GenericStream(comptime xev: type, comptime options: StreamOptions) type {
     return struct {
-        // Only generate read methods if read is enabled
-        pub usingnamespace if (options.read != .none) struct {
-            pub fn read(self: *@This(), buf: []u8) !usize { ... }
-        } else struct {};
+        pub fn read(self: *@This(), buf: []u8) !usize {
+            if (comptime options.read == .none) {
+                @compileError("read support is disabled");
+            }
+            return xev.read(options.read, self, buf);
+        }
     };
 }
 ```
@@ -750,7 +761,7 @@ Process embedded files (e.g., shader includes) at compile time:
 fn loadShader(comptime path: []const u8) [:0]const u8 {
     return comptime processIncludes(
         @embedFile(path),
-        std.fs.path.dirname(path).?,
+        std.Io.Dir.path.dirname(path).?,
     );
 }
 
@@ -777,42 +788,25 @@ fn processIncludes(
 Recursive comptime preprocessor — resolves `#include` directives by embedding
 files during compilation. Zero runtime I/O. *[Ghostty]*
 
-### Recursive Deep Equality via Type Introspection
+### Structural Equality via Type Introspection
 
-Generic equality that recurses through structs, optionals, arrays, and unions:
+Zig 0.16's `std.meta.eql` already handles structs, optionals, error unions, arrays, vectors,
+and tagged unions. Add a domain hook only where a type defines different semantics:
 
 ```zig
-pub fn deepEqual(comptime T: type, old: T, new: T) bool {
+pub fn structuralEqual(comptime T: type, old: T, new: T) bool {
     switch (@typeInfo(T)) {
-        .optional => |info| {
-            if (old == null and new == null) return true;
-            if (old == null or new == null) return false;
-            return deepEqual(info.child, old.?, new.?);
-        },
-        .array => |info| {
-            for (old, new) |o, n| {
-                if (!deepEqual(info.child, o, n)) return false;
-            }
-            return true;
-        },
-        .@"struct" => |info| {
+        .@"struct" => {
             if (@hasDecl(T, "equal")) return old.equal(new);
-            inline for (info.fields) |field| {
-                if (!deepEqual(
-                    field.type,
-                    @field(old, field.name),
-                    @field(new, field.name),
-                )) return false;
-            }
-            return true;
         },
-        else => return old == new,
+        else => {},
     }
+    return std.meta.eql(old, new);
 }
 ```
 
-Respects custom `equal` methods when present. Uses `inline for` over struct
-fields for zero-cost compile-time unrolling. *[Ghostty]*
+`std.meta.eql` compares pointers and slices by identity, not slice contents. If content equality
+is part of a domain contract, implement that type's `equal` method explicitly. *[Zig stdlib, Ghostty]*
 
 ## 5. Memory Layout & Copy Safety
 
@@ -883,7 +877,7 @@ const headers = bytes_as_slice(.inexact, Header, raw_bytes);
 ```zig
 const buffers = try allocator.alignedAlloc(
     [message_size_max]u8,
-    sector_size,  // alignment for Direct I/O
+    .fromByteUnits(sector_size), // std.mem.Alignment for Direct I/O
     count,
 );
 
@@ -941,19 +935,23 @@ Show the reader you've considered rounding:
 
 ```zig
 @divExact(total_size, block_size);           // Must divide evenly
-@divFloor(numerator, denominator);           // Round toward zero
+@divFloor(numerator, denominator);           // Round toward negative infinity
+@divTrunc(numerator, denominator);           // Round toward zero
 div_ceil(numerator, denominator);            // Round up
 ```
 *[TigerBeetle]*
 
-### Branchless Operations for Hot Paths
+### Branch Hints for Hot Paths
 
 ```zig
-pub inline fn branchless_select(comptime T: type, flag: bool, a: T, b: T) T {
+pub inline fn select_unpredictable(comptime T: type, flag: bool, a: T, b: T) T {
     @branchHint(.unpredictable);
     return if (flag) a else b;
 }
 ```
+
+`@branchHint` communicates an expectation to the optimizer; it does not guarantee branchless
+machine code. Check the generated code or benchmark before describing a path as branchless.
 *[TigerBeetle]*
 
 ### SIMD with `@Vector`
@@ -988,15 +986,15 @@ Use `mmap` for large, page-aligned allocations with OS-level lifecycle:
 pub fn init(cap: Capacity) !Page {
     const l = layout(cap);
     assert(l.total_size % std.heap.page_size_min == 0);
-    const backing = try posix.mmap(
+    const backing = try std.posix.mmap(
         null,
         l.total_size,
-        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
     );
-    errdefer posix.munmap(backing);
+    errdefer std.posix.munmap(backing);
     // ...
 }
 ```
@@ -1077,24 +1075,28 @@ fn memcpy(options: struct {
 ```
 *[TigerBeetle]*
 
-### Explicitly-Sized Types
+### Choose Sizes by Boundary
 
-Use `u32`, `u64` instead of architecture-specific `usize`:
+Use `usize` for slice indexes, lengths, and allocator sizes. Use fixed-width integers when the
+width belongs to a wire, disk, protocol, or bounded-domain contract:
 
 ```zig
-count: u32 = 0,      // not: count: usize
-offset: u64,         // not: offset: usize
+const item = items[index];       // index: usize
+const bytes = try allocator.alloc(u8, byte_count); // byte_count: usize
+
+record_count: u32,               // fixed-width on-disk field
+file_offset: u64,                // fixed-width format contract
 ```
 *[TigerBeetle]*
 
 ### Inline Functions
 
-Mark hot-path functions `pub inline fn`:
+Plain `fn` lets the optimizer choose inlining. Use `inline fn` when call-site comptime semantics
+require it, or when measurement demonstrates that forced inlining is worth the code-size cost:
 
 ```zig
-pub inline fn hash(value: anytype) u64 { ... }
-pub inline fn empty(self: *const Queue) bool { return self.count == 0; }
-pub inline fn capacity(self: *const Array) usize { return self.buffer.len; }
+fn hash(value: Value) u64 { ... }
+inline fn dispatch(comptime backend: Backend, value: Value) Result { ... }
 ```
 *[TigerBeetle]*
 
@@ -1148,7 +1150,7 @@ const Tracer = struct {
 
 ### Assertions as Documentation
 
-- Minimum 2 assertions per function.
+- Assert actual invariants; do not impose an assertion quota on every function.
 - Split compound assertions: `assert(a); assert(b);` not `assert(a and b);`.
 - Single-line implication: `if (a) assert(b);`
 - State invariants positively: `if (index < length)` not `if (index >= length)`.
@@ -1240,22 +1242,25 @@ Reuse allocations via a singly-linked free list:
 ```zig
 pub fn ObjectPool(comptime T: type, comptime max_count: comptime_int) type {
     return struct {
+        const Self = @This();
         const Node = struct { data: T, next: ?*Node = null };
 
         list: ?*Node = null,
         count: u32 = 0,
 
-        pub fn get(self: *@This(), allocator: Allocator) *Node {
+        pub fn get(self: *Self, allocator: Allocator) Allocator.Error!*Node {
             if (self.list) |node| {
                 self.list = node.next;
                 self.count -= 1;
                 if (comptime std.meta.hasFn(T, "reset")) node.data.reset();
                 return node;
             }
-            return allocator.create(Node) catch unreachable;
+            const node = try allocator.create(Node);
+            node.* = .{ .data = undefined };
+            return node;
         }
 
-        pub fn release(self: *@This(), node: *Node) void {
+        pub fn release(self: *Self, allocator: Allocator, node: *Node) void {
             if (max_count > 0 and self.count >= max_count) {
                 allocator.destroy(node);
                 return;
@@ -1268,8 +1273,9 @@ pub fn ObjectPool(comptime T: type, comptime max_count: comptime_int) type {
 }
 ```
 
-Optional `reset()` method on pooled objects clears state for reuse. Compile-time
-`max_count` bounds pool growth. *[Bun]*
+Optional `reset()` clears reused objects. `max_count` bounds retained free nodes, not total
+allocation, so `get` must propagate `error.OutOfMemory` unless the pool is separately
+preallocated by contract. *[Bun]*
 
 ## 8. Thread Safety & Concurrency
 
@@ -1282,7 +1288,7 @@ Per-thread state without synchronization:
 pub threadlocal var is_main_thread: bool = false;
 
 // Conditional threadlocal based on compile-time config
-const Storage = if (threadsafe) void else DataStruct;
+const Storage = if (threadsafe) DataStruct else void;
 threadlocal var tls_data: Storage = .{};
 
 inline fn data() *DataStruct {
@@ -1295,49 +1301,14 @@ Use `threadlocal` for per-thread caches, allocator state, or thread identity.
 Combine with comptime booleans to compile away thread-local storage when
 single-threaded. *[Bun]*
 
-### Lock-Free MPSC Queue
+### Lock-Free Queues Require a Complete Proven Algorithm
 
-Multi-producer single-consumer queue using atomics (Vyukov queue):
-
-```zig
-pub fn MpscQueue(comptime T: type) type {
-    return struct {
-        head: *T,
-        tail: *T,
-        stub: T,
-
-        pub fn push(self: *Self, v: *T) void {
-            @atomicStore(?*T, &v.next, null, .unordered);
-            const prev = @atomicRmw(*T, &self.head, .Xchg, v, .acq_rel);
-            @atomicStore(?*T, &prev.next, v, .release);
-        }
-
-        pub fn pop(self: *Self) ?*T {
-            var tail = @atomicLoad(*T, &self.tail, .unordered);
-            var next_ = @atomicLoad(?*T, &tail.next, .acquire);
-            if (tail == &self.stub) {
-                const next = next_ orelse return null;
-                @atomicStore(*T, &self.tail, next, .unordered);
-                tail = next;
-                next_ = @atomicLoad(?*T, &tail.next, .acquire);
-            }
-            if (next_) |next| {
-                @atomicStore(*T, &self.tail, next, .unordered);
-                return tail;
-            }
-            return null;
-        }
-    };
-}
-```
-
-Key atomic operations:
-- `@atomicRmw(.Xchg, ...)` — atomic exchange for lock-free enqueue.
-- `@atomicStore` / `@atomicLoad` — with explicit memory ordering (`.acquire`,
-  `.release`, `.acq_rel`).
-- No mutexes needed; the producer side is wait-free.
-
-*[libxev]*
+Do not derive an MPSC queue from only its exchange-and-link producer path. A correct intrusive
+Vyukov queue also needs stub-node initialization, the consumer's head/tail race handling, and the
+stub reinsertion path; omitting those pieces can make a one-item queue appear empty. Reuse a
+project-vetted implementation and preserve its memory orders and single-consumer contract as a
+unit. For task-oriented producer/consumer work under Zig 0.16 `std.Io`, prefer `std.Io.Queue(T)`
+unless lock-free cross-thread behavior is itself a requirement.
 
 ### Atomic Operations Summary
 
@@ -1380,10 +1351,10 @@ pub fn Cow(comptime T: type, comptime VTable: type) type {
             return .{ .owned = val };
         }
 
-        pub fn toOwned(this: *@This(), allocator: Allocator) *T {
+        pub fn toOwned(this: *@This(), allocator: Allocator) Allocator.Error!*T {
             switch (this.*) {
                 .borrowed => |b| {
-                    this.* = .{ .owned = VTable.copy(b, allocator) };
+                    this.* = .{ .owned = try VTable.copy(b, allocator) };
                 },
                 .owned => {},
             }
@@ -1489,28 +1460,34 @@ pub fn free(_: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
 Zero memory before freeing to prevent sensitive data leaks:
 
 ```zig
-export fn secure_free(ptr: *anyopaque) void {
-    const len = allocator.usable_size(ptr);
-    @memset(@as([*]u8, @ptrCast(ptr))[0..len], 0);
-    allocator.free(ptr);
+fn secureFree(allocator: Allocator, bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+    allocator.free(bytes);
 }
 ```
 
 Critical for cryptographic keys, passwords, and authentication tokens.
-Always zero before free, never rely on the allocator to clear memory. *[Bun]*
+The allocator API cannot recover an allocation's length from a bare pointer: preserve the original
+slice (or carry its exact length in the C ABI contract). Use `std.crypto.secureZero`, which prevents
+the wipe from being optimized away, before freeing with the same allocator. *[Bun, Zig stdlib]*
 
 ### Platform-Specific Type Selection
 
-Select C-compatible types based on target platform:
+Select C-compatible types based on the target. For libc types that Zig 0.16 does not expose
+through `std.c`, import a module produced by `addTranslateC` from the relevant system header:
 
 ```zig
+const c = @import("c"); // build.zig translates ucontext.h for supported POSIX targets.
+
 const Context = if (builtin.os.tag == .windows)
     std.os.windows.CONTEXT
-else if (builtin.os.tag == .linux and builtin.abi == .musl)
-    musl.jmp_buf
+else if (builtin.os.tag == .linux or builtin.os.tag == .macos)
+    c.ucontext_t
 else
-    std.c.ucontext_t;
+    void;
 ```
+
+Do not use the pre-0.16 `std.c.ucontext_t`; it is no longer present.
 *[Bun]*
 
 ### Context Pointer Smuggling
@@ -1519,22 +1496,26 @@ Encode small values (enums, indices) inside the context pointer itself:
 
 ```zig
 pub fn taggedPageAllocator(tag: VMTag) Allocator {
+    const encoded = @as(usize, @intCast(@intFromEnum(tag))) + 1;
     return .{
-        .ptr = @ptrFromInt(@as(usize, @intFromEnum(tag))),
+        .ptr = @ptrFromInt(encoded),
         .vtable = &TaggedPageAllocator.vtable,
     };
 }
 
 fn alloc(context: *anyopaque, n: usize, ...) ?[*]u8 {
+    const encoded = @intFromPtr(context);
+    assert(encoded > 0);
     const tag: VMTag = @enumFromInt(
-        @as(u8, @truncate(@intFromPtr(context))),
+        @as(u8, @truncate(encoded - 1)),
     );
     return map(n, alignment, tag);
 }
 ```
 
 Avoids an extra heap allocation for context by encoding the value directly
-in the pointer. Only safe for values that fit in a pointer. *[Ghostty]*
+in the pointer. Reserve integer zero for null and offset the encoded value by one; a non-optional
+`*anyopaque` must never contain address zero. Only safe for values that fit in a pointer. *[Ghostty]*
 
 ### Anonymous Struct C Callback Wrapper
 
@@ -1744,21 +1725,22 @@ still hold. The contract is written into the std docs, per container:
 
 - `HashMap` / `AutoHashMap`: **"any modification invalidates live iterators"**, and every iterator
   constructor repeats **"The iterator is invalidated if the map is modified."** There is no safe
-  in-place mutate-while-iterate. *[Zig stdlib — hash_map.zig:121, :238/:244/:250]*
+  in-place mutate-while-iterate. *[Zig 0.16 stdlib — hash_map.zig:112, :239/:245/:251]*
 - `ArrayHashMap`: **"Modifying the hash map while iterating is allowed, however, one must understand
-  the (well defined) behavior when mixing insertions and deletions."** The `Iterator` *object* is still
-  invalidated (it caches raw `keys`/`values`/`len` — `array_hash_map.zig:749`), and `keys()`/`values()`
-  slices may be invalidated too; what is well-defined is an **index walk** over `.keys()` re-reading
-  `.count()` each step, because `swapRemoveAt` moves the **last** element into the freed slot.
-  *[Zig stdlib — array_hash_map.zig:73, :204, :1256]*
+  the (well defined) behavior when mixing insertions and deletions."** Its `Iterator` caches raw
+  `keys`/`values` pointers and the original length, so a reallocating insertion invalidates it and a
+  removal changes what those indexes mean. For filtered deletion, use an **index walk** over `.keys()`
+  and re-read `.count()` each step; `swapRemoveAt` moves the **last** element into the freed slot.
+  *[Zig 0.16 stdlib — array_hash_map.zig:60, :265, :781]*
 - `ArrayList`: each method's doc says either **"Invalidates element pointers if additional memory is
   needed"** (`append`) or **"Never invalidates element pointers"** (`appendAssumeCapacity`). Read that
-  line before holding a pointer across a call. *[Zig stdlib — array_list.zig:27, :250, :257]*
+  line before holding a pointer across a call. *[Zig 0.16 stdlib — array_list.zig:903, :913]*
 
-**Runtime guardrail:** both maps embed a `pointer_stability: std.debug.SafetyLock`. In safe builds a
-growth op `.lock()`s it and pointer-returning ops `assertUnlocked()`, so a reentrant mutation through a
-held pointer **panics** instead of corrupting. Trust it in tests, don't rely on it in release.
-*[Zig stdlib — hash_map.zig:536, array_hash_map.zig:558, debug.zig:1705]*
+**Optional runtime guardrail:** both maps provide `lockPointers()` / `unlockPointers()` around a
+`std.debug.SafetyLock`. In safe builds, explicitly lock pointers while a key/value pointer is live;
+an operation that could invalidate it then asserts. Merely calling `getPtr()` does **not** lock the
+map automatically, and the guard is a no-op in release builds.
+*[Zig 0.16 stdlib — hash_map.zig:536, array_hash_map.zig:100, debug.zig:1816]*
 
 ### Decision guide (in order)
 
@@ -1774,9 +1756,10 @@ held pointer **panics** instead of corrupting. Trust it in tests, don't rely on 
 
 ### 1. Design it away (preferred)
 
-**Static capacity → no rehash/realloc → pointers & iterators stable by construction.** Reserve once at
-init (where OOM is handled), then use the `*AssumeCapacity` ops at runtime (see §2 for the mechanics).
-Because the backing array never moves, held pointers and in-flight iterators stay valid:
+**Static capacity → no rehash/realloc → existing element pointers stay at the same address across
+non-removing `*AssumeCapacity` inserts.** Reserve once at init (where OOM is handled), then use the
+`*AssumeCapacity` ops at runtime (see §2 for the mechanics). This does **not** relax the `HashMap`
+iterator contract: any modification still invalidates a live iterator.
 
 ```zig
 // init: reserve for the whole lifetime
@@ -1877,8 +1860,8 @@ for (candidates.items) |c| {
 }
 ```
 Ghostty uses exactly this for image eviction and env-var filtering. When a single removal *doesn't* need
-cross-entry context, `HashMap.removeByPtr(kv.key_ptr)` during a `valueIterator`/`entryIterator` walk is
-the lighter tool (it removes the current entry without a temp list). And a plain comment can carry the
+cross-entry context, use a key copied by value and remove it only after ending the iterator; Zig 0.16's
+`HashMap` contract says any modification invalidates live iterators. A plain comment can carry the
 intent — Ghostty picks `while` over `for` "because we may add items to the list while iterating," and
 notes "getOrPut invalidates pointers" right where it nulls a cached pointer.
 *[Ghostty — src/terminal/kitty/graphics_storage.zig:529 & :586, src/apprt/gtk/class/surface.zig:1595, src/config/Config.zig:4165, src/input/Binding.zig:2475]*
